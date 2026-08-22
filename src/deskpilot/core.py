@@ -17,14 +17,25 @@ CATEGORY_MAP = {
     "Installers": {".exe", ".msi", ".msix", ".appx"},
     "Audio": {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"},
     "Video": {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"},
-    "Code": {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cpp", ".c", ".cs", ".html", ".css", ".json", ".yaml", ".yml"},
+    "Code": {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cpp", ".c", ".cs", ".html", ".css", ".json", ".yaml", ".yml", ".ps1", ".bat"},
 }
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".idea", ".vscode"}
+TEMP_SUFFIXES = {".tmp", ".part", ".crdownload", ".download"}
+SCREENSHOT_WORDS = ("screenshot", "screen shot", "snipping")
 
 @dataclass(frozen=True)
 class MovePlan:
     source: Path
     destination: Path
     category: str
+
+@dataclass(frozen=True)
+class AttentionItem:
+    path: Path
+    reason: str
+    size: int
+    modified: datetime
+    severity: int
 
 def app_data_dir() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".deskpilot"))
@@ -94,7 +105,7 @@ def undo_file_moves(undo_file: Path) -> tuple[int, list[str]]:
 
 def iter_files(folder: Path) -> Iterable[Path]:
     for root, dirs, files in os.walk(folder):
-        dirs[:] = [d for d in dirs if d not in {".git", "node_modules", ".venv", "venv", "__pycache__"}]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for name in files:
             path = Path(root) / name
             try:
@@ -157,3 +168,98 @@ def large_stale_files(folder: Path, min_mb: int = 100, older_than_days: int = 90
         except (OSError, PermissionError):
             continue
     return sorted(results, key=lambda x: x[1], reverse=True)
+
+def recent_activity(folder: Path, days: int = 7, limit: int = 250):
+    cutoff = datetime.now() - timedelta(days=max(0, days))
+    results = []
+    for path in iter_files(folder):
+        try:
+            stat = path.stat()
+            modified = datetime.fromtimestamp(stat.st_mtime)
+            if modified >= cutoff:
+                results.append((path, stat.st_size, modified, category_for(path)))
+        except (OSError, PermissionError):
+            continue
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results[:limit]
+
+def attention_queue(folder: Path, now: datetime | None = None, limit: int = 300) -> list[AttentionItem]:
+    now = now or datetime.now()
+    items = []
+    for path in iter_files(folder):
+        try:
+            stat = path.stat()
+            modified = datetime.fromtimestamp(stat.st_mtime)
+        except (OSError, PermissionError):
+            continue
+        age_days = max(0, (now - modified).days)
+        suffix = path.suffix.lower()
+        lower_name = path.name.lower()
+        reason = None
+        severity = 0
+        if stat.st_size == 0:
+            reason, severity = "Empty file", 3
+        elif suffix in TEMP_SUFFIXES and age_days >= 1:
+            reason, severity = "Leftover partial or temporary download", 3
+        elif category_for(path) == "Installers" and age_days >= 14:
+            reason, severity = f"Installer is {age_days} days old", 2
+        elif category_for(path) == "Archives" and age_days >= 30:
+            reason, severity = f"Archive is {age_days} days old", 2
+        elif stat.st_size >= 1024 * 1024 * 1024 and age_days >= 30:
+            reason, severity = "Large file over 1 GB has gone cold", 2
+        elif any(word in lower_name for word in SCREENSHOT_WORDS) and age_days >= 21:
+            reason, severity = f"Old screenshot is {age_days} days old", 1
+        if reason:
+            items.append(AttentionItem(path, reason, stat.st_size, modified, severity))
+    return sorted(items, key=lambda x: (-x.severity, x.modified, -x.size))[:limit]
+
+def folder_snapshot(folder: Path) -> dict:
+    files = 0
+    total_bytes = 0
+    categories: dict[str, int] = {}
+    extensions: dict[str, int] = {}
+    newest: tuple[Path, datetime] | None = None
+    for path in iter_files(folder):
+        try:
+            stat = path.stat()
+            modified = datetime.fromtimestamp(stat.st_mtime)
+        except (OSError, PermissionError):
+            continue
+        files += 1
+        total_bytes += stat.st_size
+        category = category_for(path)
+        categories[category] = categories.get(category, 0) + 1
+        ext = path.suffix.lower() or "(none)"
+        extensions[ext] = extensions.get(ext, 0) + 1
+        if newest is None or modified > newest[1]:
+            newest = (path, modified)
+    return {
+        "files": files,
+        "bytes": total_bytes,
+        "categories": dict(sorted(categories.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "extensions": dict(sorted(extensions.items(), key=lambda kv: (-kv[1], kv[0]))[:10]),
+        "newest": newest,
+    }
+
+def handoff_file() -> Path:
+    return app_data_dir() / "handoffs.json"
+
+def load_handoffs() -> dict[str, str]:
+    try:
+        data = json.loads(handoff_file().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_handoff(folder: Path, text: str) -> None:
+    data = load_handoffs()
+    key = str(folder.expanduser().resolve())
+    text = text.strip()
+    if text:
+        data[key] = text
+    else:
+        data.pop(key, None)
+    handoff_file().write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def load_handoff(folder: Path) -> str:
+    return load_handoffs().get(str(folder.expanduser().resolve()), "")
